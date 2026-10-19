@@ -15,6 +15,7 @@ import os
 import csv
 import time
 from urllib.parse import urlparse
+from pathlib import Path
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -25,6 +26,8 @@ import streamlit as st
 import plotly.graph_objects as go
 import plotly.express as px
 import pandas as pd
+
+from huggingface_hub import hf_hub_download
 
 from src.models.classical_ml import ClassicalEnsemble  # noqa: F401
 from src.models.ensemble import MetaEnsemble  # noqa: F401
@@ -43,21 +46,25 @@ st.set_page_config(
 MODELS_DIR = "models"
 FEEDBACK_LOG = "data/feedback_log.csv"
 
+# Hugging Face model repo (set in Space Secrets or environment variables)
+HF_MODEL_REPO = os.getenv("HF_MODEL_ID", None)
+HF_TOKEN = os.getenv("HF_TOKEN", None)
+
 PRESETS = {
     "Clickbait / Viral Scam": {
-        "text": "SHOCKING: Doctors HATE this one weird natural fruit trick that cures all illnesses overnight! Big Pharma and corrupt officials are trying to ban it before everyone finds out. Share this before it gets permanently censored from the internet!!!",
+        "text": "SHOCKING: Doctors HATE this one weird natural fruit trick that cures all illnesses overnight! Big Pharma and corrupt officials are trying to ban it before everyone finds out. Shar[...]",
         "source": "viral-alert24.com",
     },
     "Legitimate News Wire": {
-        "text": "The European Central Bank kept interest rates unchanged at its policy meeting on Thursday, reiterating that future decisions will continue to follow a data-dependent approach based on incoming economic indicators and inflation trends.",
+        "text": "The European Central Bank kept interest rates unchanged at its policy meeting on Thursday, reiterating that future decisions will continue to follow a data-dependent approach base[...]",
         "source": "reuters.com",
     },
     "Conspiracy Narrative": {
-        "text": "BREAKING: An anonymous insider from deep within the agency confirms that secret weather modification facilities have been operating without public oversight. Whistleblowers state that documents reveal high-level collusion.",
+        "text": "BREAKING: An anonymous insider from deep within the agency confirms that secret weather modification facilities have been operating without public oversight. Whistleblowers state [...]",
         "source": "unfiltered-daily.net",
     },
     "Neutral Local Report": {
-        "text": "The Department of Transportation announced that routine bridge inspection and maintenance will begin on Monday morning. Motorists should anticipate minor delays during morning commute hours while lane closures are in effect.",
+        "text": "The Department of Transportation announced that routine bridge inspection and maintenance will begin on Monday morning. Motorists should anticipate minor delays during morning com[...]",
         "source": "dot.gov",
     }
 }
@@ -65,15 +72,79 @@ PRESETS = {
 
 @st.cache_resource
 def load_detector():
+    """Load models from local MODELS_DIR or download from a Hugging Face model repo if HF_MODEL_REPO is set.
+
+    Returns either a fully constructed FakeNewsDetector or a lightweight fallback detector with a compatible interface.
+    """
+    def download_file(filename: str):
+        local_dir = Path(MODELS_DIR)
+        local_dir.mkdir(exist_ok=True)
+        local_path = local_dir / filename
+        if local_path.exists():
+            return str(local_path)
+        if not HF_MODEL_REPO:
+            raise RuntimeError("HF_MODEL_ID not set and model file not present locally: {filename}")
+        # download from HF Hub
+        hf_hub_download(repo_id=HF_MODEL_REPO, filename=filename, local_dir=str(local_dir), token=HF_TOKEN)
+        return str(local_path)
+
     try:
+        # Attempt to ensure required model files exist (download if HF_MODEL_REPO provided)
+        try:
+            download_file("classical_ensemble.joblib")
+            download_file("meta_ensemble.joblib")
+            download_file("bilstm.pt")
+        except Exception:
+            # If download fails we will still try to load local files (if present) and otherwise fall back
+            pass
+
         classical_model = joblib.load(f"{MODELS_DIR}/classical_ensemble.joblib")
         meta_model = joblib.load(f"{MODELS_DIR}/meta_ensemble.joblib")
-        bundle = torch.load(f"{MODELS_DIR}/bilstm.pt", map_location="cpu", weights_only=False)
+        bundle = torch.load(f"{MODELS_DIR}/bilstm.pt", map_location="cpu")
         deep_model = DeepTextClassifier.load(bundle)
         explainer = Explainer(classical_model)
         return FakeNewsDetector(classical_model, deep_model, meta_model, explainer)
     except Exception as e:
-        return e
+        # Provide a safe fallback detector so the Streamlit app remains responsive in Spaces while models are downloading
+        class FallbackMeta:
+            def explain_weights(self):
+                return {
+                    "classical_ml": 0.35,
+                    "deep_learning": 0.28,
+                    "linguistic_analysis": 0.15,
+                    "source_credibility": 0.12,
+                    "fact_check": 0.10,
+                }
+
+        class FallbackDetector:
+            def __init__(self):
+                self.meta_model = FallbackMeta()
+
+            def predict(self, text, source="", use_fact_check=False, explain=False):
+                # Very small rule-based heuristic for demo purposes
+                keywords = ["shocking", "you won't believe", "miracle", "cure", "anonymous", "whistleblower", "secret", "leaked"]
+                s = text.lower() if isinstance(text, str) else ""
+                hits = sum(1 for k in keywords if k in s)
+                score = hits / max(1, len(keywords))
+                fake_prob = min(0.99, 0.15 + score * 0.8)
+                verdict = "FAKE" if fake_prob > 0.5 else "REAL"
+                source_score = 0.95 if source and any(x in source.lower() for x in ["reuters", "bbc", "apnews", "nytimes"]) else 0.5
+                return {
+                    "verdict": verdict,
+                    "fake_probability": fake_prob,
+                    "confidence": 0.8,
+                    "method_breakdown": {
+                        "classical_ml": {"fake_probability": fake_prob},
+                        "deep_learning": {"fake_probability": fake_prob},
+                        "linguistic_analysis": {"anomaly_score": fake_prob},
+                        "source_credibility": {"score": source_score, "domain": source or ""},
+                        "fact_check": {"available": False, "matches": []}
+                    },
+                    "explanation": {"error": "Using lightweight fallback detector while real models are unavailable."}
+                }
+
+        st.warning(f"Could not load production models: {e}. Using a lightweight demo detector instead. To enable full models, set HF_MODEL_ID in your Space secrets or upload model artifacts to the models/ directory.")
+        return FallbackDetector()
 
 
 st.title("🕵️ Multi-Method Fake News Detection System")
@@ -83,8 +154,10 @@ st.caption(
 )
 
 detector = load_detector()
+
+# If detector is an Exception object (older behavior), show an error
 if isinstance(detector, Exception):
-    st.error(f"⚠️ Could not load models ({detector}). If training is in progress, please wait a moment and refresh.")
+    st.error(f"⚠��� Could not load models ({detector}). If training is in progress, please wait a moment and refresh.")
     st.stop()
 
 tab_analyze, tab_feed, tab_benchmarks = st.tabs([
@@ -93,9 +166,9 @@ tab_analyze, tab_feed, tab_benchmarks = st.tabs([
     "⚖️ Stacked Ensemble & Benchmarks"
 ])
 
-# ==============================================================================
+# ======================================================================
 # TAB 1: ARTICLE & URL ANALYZER
-# ==============================================================================
+# ======================================================================
 with tab_analyze:
     col_mode, col_preset = st.columns([1, 1])
     with col_mode:
@@ -209,14 +282,14 @@ with tab_analyze:
                     "Source Reputation Risk",
                     "External Fact-Check"
                 ]
-                fc_val = 50.0 if not breakdown["fact_check"]["available"] else (
-                    95.0 if any("false" in (m.get("rating") or "").lower() for m in breakdown["fact_check"]["matches"]) else 50.0
+                fc_val = 50.0 if not breakdown.get("fact_check", {}).get("available", False) else (
+                    95.0 if any("false" in (m.get("rating") or "").lower() for m in breakdown.get("fact_check", {}).get("matches", [])) else 50.0
                 )
                 vals = [
-                    breakdown["classical_ml"]["fake_probability"] * 100,
-                    breakdown["deep_learning"]["fake_probability"] * 100,
-                    breakdown["linguistic_analysis"]["anomaly_score"] * 100,
-                    (1.0 - breakdown["source_credibility"]["score"]) * 100,
+                    breakdown.get("classical_ml", {}).get("fake_probability", 0.5) * 100,
+                    breakdown.get("deep_learning", {}).get("fake_probability", 0.5) * 100,
+                    breakdown.get("linguistic_analysis", {}).get("anomaly_score", 0.5) * 100,
+                    (1.0 - breakdown.get("source_credibility", {}).get("score", 0.5)) * 100,
                     fc_val
                 ]
                 bar_fig = go.Figure(go.Bar(
@@ -241,7 +314,7 @@ with tab_analyze:
 
             with c1:
                 st.markdown("**1. Classical ML Algorithms**")
-                pm = breakdown["classical_ml"]["per_model"]
+                pm = breakdown.get("classical_ml", {}).get("per_model", {})
                 clf_df = pd.DataFrame([
                     {"Algorithm": k.replace("_", " ").title(), "Fake Prob": f"{v*100:.1f}%"}
                     for k, v in pm.items()
@@ -250,7 +323,7 @@ with tab_analyze:
 
             with c2:
                 st.markdown("**2. Source Credibility**")
-                cred = breakdown["source_credibility"]
+                cred = breakdown.get("source_credibility", {})
                 st.write(f"Domain: `{cred.get('domain', 'None')}`")
                 st.write(f"Trust Tier: **{cred.get('tier', 'unknown').upper()}** (Score: {cred.get('score', 0.5):.2f})")
                 for reason in cred.get("reasons", []):
@@ -258,7 +331,7 @@ with tab_analyze:
 
             with c3:
                 st.markdown("**3. Stylometric & Linguistic Red Flags**")
-                ling = breakdown["linguistic_analysis"]["features"]
+                ling = breakdown.get("linguistic_analysis", {}).get("features", {})
                 st.write(f"Clickbait keywords: **{int(ling.get('clickbait_phrase_count', 0))}**")
                 st.write(f"ALL-CAPS words: **{ling.get('caps_word_ratio', 0)*100:.1f}%**")
                 st.write(f"Exclamation density: **{ling.get('exclamation_ratio', 0):.2f} / sent**")
@@ -266,11 +339,11 @@ with tab_analyze:
                 st.write(f"Vague sourcing count: **{int(ling.get('vague_sourcing_count', 0))}**")
 
             # Explainability Section
-            if show_explainer and "explanation" in result and "error" not in result["explanation"]:
+            if show_explainer and "explanation" in result and "error" not in result.get("explanation", {}):
                 st.markdown("---")
                 st.markdown("#### 🔦 Explainability Signals (Dual AI Attribution)")
                 e_col1, e_col2 = st.columns(2)
-                exp = result["explanation"]
+                exp = result.get("explanation", {})
 
                 with e_col1:
                     st.markdown("**LIME Feature Attribution (Classical Ensemble)**")
@@ -306,7 +379,7 @@ with tab_analyze:
                 if st.button("Submit Feedback"):
                     os.makedirs(os.path.dirname(FEEDBACK_LOG), exist_ok=True)
                     has_header = os.path.isfile(FEEDBACK_LOG)
-                    with open(FEEDBACK_LOG, "a", newline="", encoding="utf-8") as f:
+                    with open(FEEDBACK_LOG, "a", newline=",", encoding="utf-8") as f:
                         writer = csv.writer(f)
                         if not has_header:
                             writer.writerow(["text", "predicted_verdict", "correct_verdict", "notes", "timestamp"])
@@ -314,9 +387,9 @@ with tab_analyze:
                     st.success("✅ Correction logged successfully! It will be included in the next training pass.")
 
 
-# ==============================================================================
+# ======================================================================
 # TAB 2: LIVE FEED MONITOR
-# ==============================================================================
+# ======================================================================
 with tab_feed:
     st.markdown("### 📡 Live RSS Feed Monitoring")
     st.write("Scan online news feeds to detect, score, and stream flagged articles in real time.")
@@ -376,9 +449,9 @@ with tab_feed:
                 st.error(f"Error parsing feed: {e}")
 
 
-# ==============================================================================
+# ======================================================================
 # TAB 3: MODEL ARCHITECTURE & BENCHMARKS
-# ==============================================================================
+# ======================================================================
 with tab_benchmarks:
     st.markdown("### ⚖️ Meta-Classifier Stacking Weights & Method Comparison")
     st.write(
