@@ -16,4 +16,6 @@ joblib>=1.3.0
 requests>=2.31.0
 python-multipart>=0.0.6
 websockets>=12.0
-lxml_html_clean
+lxml>=4.9.0
+beautifulsoup4>=4.12.0
+huggingface_hub>=0.15.1
